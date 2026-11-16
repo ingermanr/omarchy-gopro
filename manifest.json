@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.ingermanr.gopro",
+  "name": "GoPro Webcam",
+  "version": "1.0.0",
+  "author": "ingermanr",
+  "license": "MIT",
+  "description": "Control a USB-connected GoPro HERO12 webcam from the Omarchy bar: start/stop the stream, switch lens and resolution, record, take a photo, and download the newest SD card file.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "GoPro Webcam",
+    "description": "Start/stop the GoPro webcam and switch lens and resolution.",
+    "category": "Hardware",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 15
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Background refresh interval (seconds)",
+        "min": 5,
+        "max": 3600,
+        "step": 5,
+        "defaultValue": 15
+      }
+    ]
+  }
+}

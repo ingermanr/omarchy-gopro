@@ -1,0 +1,334 @@
+#!/usr/bin/env bash
+# Control a GoPro HERO12 over USB ("GoPro Connect" mode) and use it as a webcam via v4l2loopback.
+# Run with "help" for the list of commands.
+set -euo pipefail
+umask 077
+
+DEVICE=/dev/video42
+UDP_PORT=8554
+# Current webcam start request (line 1) and the PID of the stream that owns it (line 2);
+# shared by the running stream, its watchdog and live lens/res changes.
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+STATE="$RUNTIME_DIR/gopro-webcam.start"
+LOG="$RUNTIME_DIR/gopro-webcam.log"
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") <command> [args]
+
+Webcam:
+  start [-d] [1080|720|480] [wide|narrow|superview|linear]
+                                                        Start webcam (default: 1080 wide)
+                                                        -d: run in background (log: $LOG)
+  stop                                                  Stop webcam
+  lens <wide|narrow|superview|linear>                   Change lens while the webcam runs
+  res <1080|720|480>                                    Change resolution while the webcam runs
+
+Camera (webcam must be stopped):
+  mode <video|photo|timelapse>                          Switch capture mode
+  record | record-stop                                  Start/stop video recording
+  photo                                                 Take a photo
+  zoom <0-100>                                          Digital zoom percent
+
+Info and media:
+  status [--json]                                       Battery, SD space, webcam state, lens
+  media                                                 List files on the SD card
+  download <file|latest> [dir]                          Download a file (default dir: current)
+EOF
+}
+
+# The camera sits at 172.2X.1YZ.51 on its USB network; reuse the host's subnet.
+find_camera() {
+  local iface="" dev host_ip
+  for dev in /sys/class/net/*; do
+    if [[ "$(basename "$(readlink -f "$dev/device/driver" 2>/dev/null)")" == cdc_ncm ]]; then
+      iface=$(basename "$dev"); break
+    fi
+  done
+  [[ -n $iface ]] || { echo "GoPro not found: connect it via USB (GoPro Connect mode)." >&2; exit 1; }
+  host_ip=$(ip -4 -br addr show "$iface" | awk '{print $3}' | cut -d/ -f1)
+  CAM="http://${host_ip%.*}.51:8080"
+}
+
+api() { curl -fsS -m 5 "$CAM$1" >/dev/null; }
+json() { curl -fsS -m 10 "$CAM$1"; }
+webcam_status() { curl -fsS -m 5 "$CAM/gopro/webcam/status" 2>/dev/null | tr -dc '0-9:' | cut -d: -f2; }
+webcam_running() { pgrep -f "ffmpeg.*udp://@:${UDP_PORT}" >/dev/null; }
+start_path() { head -1 "$STATE"; }
+state_owner() { sed -n 2p "$STATE" 2>/dev/null; }
+
+res_code() {
+  case "$1" in 1080) echo 12 ;; 720) echo 7 ;; 480) echo 4 ;; *) echo "Invalid resolution: $1" >&2; exit 1 ;; esac
+}
+lens_code() {
+  case "$1" in wide) echo 0 ;; narrow) echo 2 ;; superview) echo 3 ;; linear) echo 4 ;; *) echo "Invalid lens: $1" >&2; exit 1 ;; esac
+}
+
+# Start the camera's webcam stream using the request saved in $STATE.
+# The camera may silently ignore start right after stop/exit; retry until streaming (status 2).
+camera_stream_start() {
+  local status=""
+  for _ in 1 2 3 4 5; do
+    api "$(start_path)" || true
+    sleep 2
+    status=$(webcam_status)
+    [[ $status == 2 ]] && return 0
+  done
+  echo "GoPro did not start streaming." >&2
+  return 1
+}
+
+stop_stream() {
+  # ffmpeg can block on the UDP read once the camera stops sending, ignoring SIGTERM.
+  pkill -f "ffmpeg.*udp://@:${UDP_PORT}" 2>/dev/null || true
+  for _ in $(seq 6); do webcam_running || break; sleep 0.5; done
+  pkill -KILL -f "ffmpeg.*udp://@:${UDP_PORT}" 2>/dev/null || true
+  api /gopro/webcam/stop || true
+  api /gopro/webcam/exit || true
+}
+
+stop() {
+  stop_stream
+  rm -f "$STATE"
+  echo "GoPro webcam stopped."
+}
+
+# On exit, only clean up if no newer "start" has taken over the stream.
+cleanup() {
+  kill $(jobs -p) 2>/dev/null || true
+  [[ $(state_owner) == "$$" ]] && stop
+}
+
+# With exclusive_caps=1 the loopback only advertises capture once ffmpeg writes to it,
+# but WirePlumber probes it earlier and skips it. Restart WirePlumber once frames flow
+# so apps like OBS see the camera; skip it when the source is already registered.
+refresh_pipewire() {
+  local label
+  label=$(cat "/sys/class/video4linux/$(basename "$DEVICE")/name")
+  for _ in $(seq 30); do
+    v4l2-ctl -d "$DEVICE" --all 2>/dev/null | grep -q "Format Video Capture" && break
+    sleep 1
+  done
+  wpctl status | grep -qF "$label (V4L2)" && return
+  systemctl --user restart wireplumber
+}
+
+# Without periodic traffic the camera stops the webcam stream after its idle timeout.
+# Send keep-alives and restart the stream if the camera drops it anyway.
+watchdog() {
+  local n=0 status
+  while sleep 3; do
+    api /gopro/camera/keep_alive || true
+    (( ++n % 5 )) && continue
+    status=$(webcam_status)
+    if [[ $status != 2 && $(state_owner) == "$$" ]]; then
+      echo "Camera stopped streaming (status ${status:-?}), restarting..." >&2
+      api "$(start_path)" || true
+    fi
+  done
+}
+
+start() {
+  local res fov
+  res=$(res_code "${1:-1080}")
+  fov=$(lens_code "${2:-wide}")
+
+  [[ -e $DEVICE ]] || sudo modprobe v4l2loopback devices=1 video_nr=42 card_label="GoPro HERO12" exclusive_caps=1
+
+  # Claim the state before stopping a previous instance, so its cleanup leaves the camera alone.
+  printf '%s\n%s\n' "/gopro/webcam/start?res=${res}&fov=${fov}&port=${UDP_PORT}" "$$" > "$STATE"
+  stop_stream
+  for _ in $(seq 10); do webcam_running || break; sleep 0.5; done
+  api "/gopro/camera/control/wired_usb?p=1" || true
+  trap cleanup EXIT
+  camera_stream_start || exit 1
+  echo "GoPro webcam running on $DEVICE (Ctrl+C to stop)."
+  refresh_pipewire &
+  watchdog &
+  ffmpeg -hide_banner -loglevel error -nostdin -threads 1 \
+    -fflags nobuffer -flags low_delay \
+    -i "udp://@:${UDP_PORT}?overrun_nonfatal=1&fifo_size=50000000" \
+    -vf format=yuv420p -f v4l2 "$DEVICE"
+}
+
+# Run "start" in its own session, detached from the terminal, and wait until it streams.
+start_detached() {
+  local pid
+  setsid nohup "$0" start "$@" > "$LOG" 2>&1 < /dev/null &
+  pid=$!
+  for _ in $(seq 30); do
+    sleep 1
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "GoPro webcam failed to start:" >&2; tail -5 "$LOG" >&2; exit 1
+    fi
+    if [[ $(state_owner) == "$pid" && $(webcam_status) == 2 ]] && webcam_running; then
+      echo "GoPro webcam running in background on $DEVICE. Stop it with: $(basename "$0") stop"
+      return 0
+    fi
+  done
+  echo "GoPro webcam is still starting; check $LOG" >&2
+}
+
+# The camera rejects lens/resolution changes while streaming, so briefly restart its
+# stream with the new parameters. ffmpeg and /dev/video42 stay open, so apps keep the source.
+change_stream() {
+  local key=$1 value=$2
+  webcam_running && [[ -f $STATE ]] || { echo "Webcam is not running. Use: $(basename "$0") start" >&2; exit 1; }
+
+  # 1. Aplicar el cambio solicitado en el fichero de estado
+  sed -i -E "s/([?&]${key}=)[0-9]+/\1${value}/" "$STATE"
+
+  # 2. Detener el stream actual para poder reiniciar con los nuevos parámetros
+  api /gopro/webcam/stop || true
+  sleep 1
+
+  # 3. Caso especial: cambiar a linear (fov=4). La cámara ignora un cambio directo a
+  #    linear desde narrow (el setting 43 no lo refleja). Estrategia: streamear breve-
+  #    mente en wide (fov=0) primero para que la cámara acepte el destino lineal.
+  if [[ $key == fov && $value == 4 ]]; then
+    local target owner
+    target=$(start_path)            # path solicitado (con fov=4)
+    owner=$(sed -n 2p "$STATE")     # PID del propietario del stream
+
+    # Pre-streamear en wide
+    start_path | sed -E 's/([?&]fov=)[0-9]+/\10/' > "$STATE.tmp" \
+      && sed -n 2p "$STATE" >> "$STATE.tmp" \
+      && mv "$STATE.tmp" "$STATE"
+
+    if camera_stream_start; then
+      api /gopro/webcam/stop || true
+      sleep 1
+    else
+      echo "Wide pre-stream failed; aborting linear switch." >&2
+      printf '%s\n%s\n' "$target" "$owner" > "$STATE"
+      return 1
+    fi
+
+    # Restaurar el destino lineal y el owner original
+    printf '%s\n%s\n' "$target" "$owner" > "$STATE"
+  fi
+
+  # 4. Iniciar el stream con los parámetros finales
+  camera_stream_start
+}
+
+require_webcam_off() {
+  if webcam_running || [[ $(webcam_status) == 2 ]]; then
+    echo "Stop the webcam first: $(basename "$0") stop" >&2; exit 1
+  fi
+}
+
+# Recording and photos fail on USB power alone (the camera answers with HTTP errors).
+require_battery() {
+  local present
+  present=$(json /gopro/camera/state | python3 -c 'import json, sys; print(json.load(sys.stdin)["status"].get("1", 0))')
+  [[ $present == 1 ]] || { echo "Insert a battery: recording and photos need one (USB power only runs the webcam)." >&2; exit 1; }
+}
+
+set_mode() {
+  local group
+  case "$1" in video) group=1000 ;; photo) group=1001 ;; timelapse) group=1002 ;; *) echo "Invalid mode: $1" >&2; exit 1 ;; esac
+  api "/gopro/camera/presets/set_group?id=${group}"
+}
+
+status() {
+  json /gopro/camera/state | python3 -c '
+import json, sys
+d = json.load(sys.stdin); st, se = d["status"], d["settings"]
+lenses = {0: "wide", 2: "narrow", 3: "superview", 4: "linear"}
+print("Battery:       %s" % ("%s%%" % st.get("70") if st.get("1") else "none (USB power)"))
+print("SD free:       %.1f GB" % (st.get("54", 0) / 1024 / 1024))
+print("Recording:     %s" % ("yes" if st.get("10") else "no"))
+print("Webcam lens:   %s" % lenses.get(se.get("43"), se.get("43")))
+'
+  local s
+  s=$(webcam_status)
+  case "$s" in 2) s="streaming" ;; 1) s="idle" ;; 0) s="off" ;; esac
+  echo "Webcam:        ${s:-unknown}"
+}
+
+# Machine-readable status for the Omarchy shell plugin. Works when the camera is unplugged.
+status_json() {
+  if ! (find_camera) 2>/dev/null; then
+    echo '{"connected": false}'; return
+  fi
+  find_camera
+  local running=false res="" fov=""
+  webcam_running && running=true
+  if [[ -f $STATE ]]; then
+    res=$(start_path | grep -oE 'res=[0-9]+' | cut -d= -f2)
+    fov=$(start_path | grep -oE 'fov=[0-9]+' | cut -d= -f2)
+  fi
+  local state
+  state=$(json /gopro/camera/state 2>/dev/null) || { echo '{"connected": false}'; return; }
+  python3 -c '
+import json, sys
+d = json.loads(sys.argv[4]); st, se = d["status"], d["settings"]
+webcam = {"0": "off", "1": "idle", "2": "streaming"}.get(sys.argv[1], "unknown")
+print(json.dumps({
+    "connected": True,
+    "webcam": webcam,
+    "process": sys.argv[2] == "true",
+    # Setting 43 does not reflect "narrow", so prefer the lens requested for the running stream.
+    "lens": {0: "wide", 2: "narrow", 3: "superview", 4: "linear"}.get(
+        int(sys.argv[5]) if sys.argv[5] else se.get("43"), "unknown"),
+    "res": {"12": "1080", "7": "720", "4": "480"}.get(sys.argv[3]),
+    "recording": bool(st.get("10")),
+    "battery": st.get("70") if st.get("1") else None,
+    "sdFreeGb": round(st.get("54", 0) / 1024 / 1024, 1),
+}))
+' "$(webcam_status)" "$running" "$res" "$state" "$fov"
+}
+
+# Print "<folder>/<file>" for every file on the SD card, oldest first.
+media_paths() {
+  json /gopro/media/list | python3 -c '
+import json, sys
+for d in json.load(sys.stdin).get("media", []):
+    for f in d["fs"]:
+        print(d["d"] + "/" + f["n"])
+'
+}
+
+download() {
+  local name=${1:?Usage: download <file|latest> [dir]} dir=${2:-.} path
+  if [[ $name == latest ]]; then
+    path=$(media_paths | tail -1)
+  else
+    path=$(media_paths | grep -m1 "/${name}$" || true)
+  fi
+  [[ -n $path ]] || { echo "File not found: $name" >&2; exit 1; }
+  echo "Downloading ${path##*/} to $dir"
+  curl -f --progress-bar -o "$dir/${path##*/}" "$CAM/videos/DCIM/$path"
+}
+
+cmd=${1:-start}
+[[ $cmd == help || $cmd == -h || $cmd == --help ]] && { usage; exit 0; }
+shift || true
+[[ $cmd == status && ${1:-} == --json ]] && { status_json; exit 0; }
+find_camera
+
+case "$cmd" in
+  start)
+    if [[ ${1:-} == -d || ${1:-} == --detach ]]; then
+      shift; start_detached "$@"
+    else
+      start "$@"
+    fi ;;
+  stop) stop ;;
+  lens) change_stream fov "$(lens_code "${1:?Usage: lens <wide|narrow|superview|linear>}")" && echo "Lens: $1" ;;
+  res) change_stream res "$(res_code "${1:?Usage: res <1080|720|480>}")" && echo "Resolution: $1" ;;
+  mode) require_webcam_off; set_mode "${1:?Usage: mode <video|photo|timelapse>}" && echo "Mode: $1" ;;
+  record) require_webcam_off; require_battery; set_mode video;
+    if api /gopro/camera/shutter/start; then echo "Recording..."; else
+      echo "Recording not supported by this camera firmware (HTTP 500 on shutter/start)." >&2; exit 1; fi ;;
+  record-stop) api /gopro/camera/shutter/stop && echo "Recording stopped." ;;
+  photo) require_webcam_off; require_battery; set_mode photo;
+    if api /gopro/camera/shutter/start; then echo "Photo taken."; else
+      echo "Photo not supported by this camera firmware (HTTP 500 on shutter/start)." >&2; exit 1; fi ;;
+  zoom) require_webcam_off; api "/gopro/camera/digital_zoom?percent=${1:?Usage: zoom <0-100>}" && echo "Zoom: $1%" ;;
+  status) status ;;
+  media) media_paths | sed 's|.*/||' ;;
+  download) download "$@" ;;
+  *) usage >&2; exit 1 ;;
+esac
