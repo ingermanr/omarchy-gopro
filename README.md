@@ -4,6 +4,8 @@ Bar widget for [Omarchy](https://omarchy.org/) Quattro that controls a GoPro
 connected over USB in **GoPro Connect** mode and uses it as a webcam through
 `v4l2loopback`.
 
+![GoPro Webcam bar widget streaming while lens and resolution are selectable](preview.png)
+
 ## What it does
 
 - **Bar icon**: dimmed when the camera is off or disconnected, normal while
