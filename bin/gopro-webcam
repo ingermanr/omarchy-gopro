@@ -53,7 +53,17 @@ find_camera() {
 api() { curl -fsS -m 5 "$CAM$1" >/dev/null; }
 json() { curl -fsS -m 10 "$CAM$1"; }
 webcam_status() { curl -fsS -m 5 "$CAM/gopro/webcam/status" 2>/dev/null | tr -dc '0-9:' | cut -d: -f2; }
-webcam_running() { pgrep -f "ffmpeg.*udp://@:${UDP_PORT}" >/dev/null; }
+# PIDs of the ffmpeg process feeding the UDP port. pgrep -f alone also matches
+# unrelated processes that merely mention the pattern (editors, a grep, a shell
+# wrapper), so each PID is filtered by the executable it actually runs.
+webcam_pids() {
+  local pid
+  for pid in $(pgrep -f "udp://@:${UDP_PORT}" 2>/dev/null); do
+    [[ $(basename "$(readlink -f "/proc/$pid/exe" 2>/dev/null)") == ffmpeg ]] && echo "$pid"
+  done
+  return 0
+}
+webcam_running() { [[ -n $(webcam_pids) ]]; }
 start_path() { head -1 "$STATE"; }
 state_owner() { sed -n 2p "$STATE" 2>/dev/null; }
 
@@ -79,10 +89,13 @@ camera_stream_start() {
 }
 
 stop_stream() {
+  local pids
   # ffmpeg can block on the UDP read once the camera stops sending, ignoring SIGTERM.
-  pkill -f "ffmpeg.*udp://@:${UDP_PORT}" 2>/dev/null || true
+  pids=$(webcam_pids)
+  [[ -n $pids ]] && kill $pids 2>/dev/null
   for _ in $(seq 6); do webcam_running || break; sleep 0.5; done
-  pkill -KILL -f "ffmpeg.*udp://@:${UDP_PORT}" 2>/dev/null || true
+  pids=$(webcam_pids)
+  [[ -n $pids ]] && kill -KILL $pids 2>/dev/null
   api /gopro/webcam/stop || true
   api /gopro/webcam/exit || true
 }
