@@ -39,15 +39,16 @@ EOF
 
 # The camera sits at 172.2X.1YZ.51 on its USB network; reuse the host's subnet.
 find_camera() {
-  local iface="" dev host_ip
+  local iface="" dev
   for dev in /sys/class/net/*; do
     if [[ "$(basename "$(readlink -f "$dev/device/driver" 2>/dev/null)")" == cdc_ncm ]]; then
       iface=$(basename "$dev"); break
     fi
   done
   [[ -n $iface ]] || { echo "GoPro not found: connect it via USB (GoPro Connect mode)." >&2; exit 1; }
-  host_ip=$(ip -4 -br addr show "$iface" | awk '{print $3}' | cut -d/ -f1)
-  CAM="http://${host_ip%.*}.51:8080"
+  HOST_IP=$(ip -4 -br addr show "$iface" | awk '{print $3}' | cut -d/ -f1)
+  CAM_IP="${HOST_IP%.*}.51"
+  CAM="http://${CAM_IP}:8080"
 }
 
 api() { curl -fsS -m 5 "$CAM$1" >/dev/null; }
@@ -160,7 +161,7 @@ start() {
   watchdog &
   ffmpeg -hide_banner -loglevel error -nostdin -threads 1 \
     -fflags nobuffer -flags low_delay \
-    -i "udp://@:${UDP_PORT}?overrun_nonfatal=1&fifo_size=50000000" \
+    -i "udp://@:${UDP_PORT}?localaddr=${HOST_IP}&sources=${CAM_IP}&overrun_nonfatal=1&fifo_size=50000000" \
     -vf format=yuv420p -f v4l2 "$DEVICE"
 }
 
@@ -311,8 +312,25 @@ download() {
     path=$(media_paths | grep -m1 "/${name}$" || true)
   fi
   [[ -n $path ]] || { echo "File not found: $name" >&2; exit 1; }
-  echo "Downloading ${path##*/} to $dir"
-  curl -f --progress-bar -o "$dir/${path##*/}" "$CAM/videos/DCIM/$path"
+  # The camera chooses these names, so accept only plain "<folder>/<file>" paths.
+  [[ $path =~ ^[A-Za-z0-9_]+/[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] \
+    || { echo "Refusing unexpected file name from camera: $path" >&2; exit 1; }
+  local file=${path##*/} target tmp
+  target="$dir/$file"
+  # Never replace an existing file or follow a symlink planted at the target.
+  [[ -e $target || -L $target ]] && { echo "Already exists: $target" >&2; exit 1; }
+  echo "Downloading $file to $dir"
+  # mktemp creates a fresh file exclusively; mv --no-clobber renames it atomically
+  # without replacing anything that appeared at the target meanwhile.
+  tmp=$(mktemp "$dir/.gopro-download.XXXXXX")
+  if ! curl -f --progress-bar -o "$tmp" "$CAM/videos/DCIM/$path"; then
+    rm -f "$tmp"; exit 1
+  fi
+  # Some coreutils versions exit non-zero when -n skips; the check below decides.
+  mv --no-clobber "$tmp" "$target" || true
+  if [[ -e $tmp ]]; then
+    rm -f "$tmp"; echo "Already exists: $target" >&2; exit 1
+  fi
 }
 
 cmd=${1:-start}
