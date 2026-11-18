@@ -10,6 +10,9 @@ UDP_PORT=8554
 # shared by the running stream, its watchdog and live lens/res changes.
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 STATE="$RUNTIME_DIR/gopro-webcam.start"
+# PID of the ffmpeg this plugin launched for the current stream. Signals are only
+# ever sent to this PID, never to a process found by searching the process table.
+FFMPEG_PID_FILE="$RUNTIME_DIR/gopro-webcam.ffmpeg"
 LOG="$RUNTIME_DIR/gopro-webcam.log"
 
 usage() {
@@ -54,17 +57,20 @@ find_camera() {
 api() { curl -fsS -m 5 "$CAM$1" >/dev/null; }
 json() { curl -fsS -m 10 "$CAM$1"; }
 webcam_status() { curl -fsS -m 5 "$CAM/gopro/webcam/status" 2>/dev/null | tr -dc '0-9:' | cut -d: -f2; }
-# PIDs of the ffmpeg process feeding the UDP port. pgrep -f alone also matches
-# unrelated processes that merely mention the pattern (editors, a grep, a shell
-# wrapper), so each PID is filtered by the executable it actually runs.
-webcam_pids() {
-  local pid
-  for pid in $(pgrep -f "udp://@:${UDP_PORT}" 2>/dev/null); do
-    [[ $(basename "$(readlink -f "/proc/$pid/exe" 2>/dev/null)") == ffmpeg ]] && echo "$pid"
-  done
-  return 0
+# PID of the ffmpeg process this plugin started, provided it is still the same process.
+# A recorded PID can be recycled by the kernel, so identity is re-checked before any
+# signal is sent: the PID must still run ffmpeg with this plugin's own output device and
+# UDP input. An unrelated ffmpeg session never matches, so it is never signalled.
+ffmpeg_pid() {
+  local pid cmdline
+  pid=$(head -1 "$FFMPEG_PID_FILE" 2>/dev/null) || return 0
+  [[ $pid =~ ^[0-9]+$ ]] || return 0
+  [[ $(basename "$(readlink -f "/proc/$pid/exe" 2>/dev/null)") == ffmpeg ]] || return 0
+  cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || return 0
+  [[ $cmdline == *"$DEVICE"* && $cmdline == *"udp://@:${UDP_PORT}"* ]] || return 0
+  echo "$pid"
 }
-webcam_running() { [[ -n $(webcam_pids) ]]; }
+webcam_running() { [[ -n $(ffmpeg_pid) ]]; }
 start_path() { head -1 "$STATE"; }
 state_owner() { sed -n 2p "$STATE" 2>/dev/null; }
 
@@ -90,13 +96,14 @@ camera_stream_start() {
 }
 
 stop_stream() {
-  local pids
+  local pid
   # ffmpeg can block on the UDP read once the camera stops sending, ignoring SIGTERM.
-  pids=$(webcam_pids)
-  [[ -n $pids ]] && kill $pids 2>/dev/null
+  pid=$(ffmpeg_pid)
+  [[ -n $pid ]] && kill "$pid" 2>/dev/null
   for _ in $(seq 6); do webcam_running || break; sleep 0.5; done
-  pids=$(webcam_pids)
-  [[ -n $pids ]] && kill -KILL $pids 2>/dev/null
+  pid=$(ffmpeg_pid)
+  [[ -n $pid ]] && kill -KILL "$pid" 2>/dev/null
+  rm -f "$FFMPEG_PID_FILE"
   api /gopro/webcam/stop || true
   api /gopro/webcam/exit || true
 }
@@ -143,7 +150,7 @@ watchdog() {
 }
 
 start() {
-  local res fov
+  local res fov stream_pid
   res=$(res_code "${1:-1080}")
   fov=$(lens_code "${2:-wide}")
 
@@ -162,7 +169,13 @@ start() {
   ffmpeg -hide_banner -loglevel error -nostdin -threads 1 \
     -fflags nobuffer -flags low_delay \
     -i "udp://@:${UDP_PORT}?localaddr=${HOST_IP}&sources=${CAM_IP}&overrun_nonfatal=1&fifo_size=50000000" \
-    -vf format=yuv420p -f v4l2 "$DEVICE"
+    -vf format=yuv420p -f v4l2 "$DEVICE" &
+  stream_pid=$!
+  # Record the child so stop/watchdog address this exact process. The PID file is
+  # written immediately after the launch, before anyone can observe a running stream.
+  printf '%s\n' "$stream_pid" > "$FFMPEG_PID_FILE"
+  # Stay in the foreground like the plain "ffmpeg ..." call did, and propagate its status.
+  wait "$stream_pid"
 }
 
 # Run "start" in its own session, detached from the terminal, and wait until it streams.

@@ -15,6 +15,10 @@ connected over USB in **GoPro Connect** mode and uses it as a webcam through
   record, photo, and download of the newest SD card file to `~/Videos`.
 - Record and photo are disabled while streaming and while the camera runs on
   USB power only, because the camera refuses both without a battery.
+- **Stopping is scoped**: the helper only signals the `ffmpeg` it launched.
+  Another `ffmpeg` session is never touched, even if it reads the same UDP
+  stream. See [docs/review-notes.md](docs/review-notes.md) for the ownership
+  model and the tests behind it.
 
 Everything runs through `bin/gopro-webcam`, a small bash helper shipped inside
 this plugin. The QML resolves it relative to `Panel.qml`, so the plugin is
