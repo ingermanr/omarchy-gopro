@@ -29,8 +29,9 @@ self-contained and works wherever it is installed.
 - Omarchy Quattro (4.x) with the `omarchy plugin` commands.
 - GoPro HERO12 in USB webcam mode. Other models using the same HTTP API are
   untested.
-- `ffmpeg`, `curl`, `v4l2-utils` (`v4l2-ctl`) and the `v4l2loopback` kernel
-  module.
+- `ffmpeg`, `curl`, `python3` (3.9+), `flock` (util-linux), `v4l2-utils`
+  (`v4l2-ctl`) and the `v4l2loopback` kernel module. Stopping uses pidfds, so
+  Linux 5.3 or newer.
 - A battery in the camera for record and photo.
 
 ## Install

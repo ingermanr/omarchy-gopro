@@ -10,9 +10,13 @@ UDP_PORT=8554
 # shared by the running stream, its watchdog and live lens/res changes.
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 STATE="$RUNTIME_DIR/gopro-webcam.start"
-# PID of the ffmpeg this plugin launched for the current stream. Signals are only
-# ever sent to this PID, never to a process found by searching the process table.
+# "<pid> <start time>" of the ffmpeg this plugin launched for the current stream.
+# Signals only ever reach that exact process, never one found by searching the process table.
 FFMPEG_PID_FILE="$RUNTIME_DIR/gopro-webcam.ffmpeg"
+# Serializes session transitions (start, stop, exit cleanup, lens/res changes), which
+# all rewrite $STATE and $FFMPEG_PID_FILE.
+LOCK="$RUNTIME_DIR/gopro-webcam.lock"
+LOCK_FD=""
 LOG="$RUNTIME_DIR/gopro-webcam.log"
 
 usage() {
@@ -57,18 +61,36 @@ find_camera() {
 api() { curl -fsS -m 5 "$CAM$1" >/dev/null; }
 json() { curl -fsS -m 10 "$CAM$1"; }
 webcam_status() { curl -fsS -m 5 "$CAM/gopro/webcam/status" 2>/dev/null | tr -dc '0-9:' | cut -d: -f2; }
-# PID of the ffmpeg process this plugin started, provided it is still the same process.
-# A recorded PID can be recycled by the kernel, so identity is re-checked before any
-# signal is sent: the PID must still run ffmpeg with this plugin's own output device and
-# UDP input. An unrelated ffmpeg session never matches, so it is never signalled.
+# Start time (clock ticks since boot, /proc/<pid>/stat field 22) of a live, non-zombie
+# process. A PID plus its start time names one process for the whole boot: a process that
+# later reuses the PID has a later start time, whatever its executable and arguments.
+proc_starttime() {
+  local stat
+  stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 0
+  read -ra stat <<< "${stat##*) }"   # comm may contain spaces; fields resume after ")"
+  [[ ${stat[0]} == [ZX] ]] || echo "${stat[19]}"
+}
+record_stream() { printf '%s %s\n' "$1" "$(proc_starttime "$1")" > "$FFMPEG_PID_FILE"; }
+# PID of the ffmpeg this plugin started, provided that exact process is still alive.
 ffmpeg_pid() {
-  local pid cmdline
-  pid=$(head -1 "$FFMPEG_PID_FILE" 2>/dev/null) || return 0
-  [[ $pid =~ ^[0-9]+$ ]] || return 0
-  [[ $(basename "$(readlink -f "/proc/$pid/exe" 2>/dev/null)") == ffmpeg ]] || return 0
-  cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || return 0
-  [[ $cmdline == *"$DEVICE"* && $cmdline == *"udp://@:${UDP_PORT}"* ]] || return 0
-  echo "$pid"
+  local pid start
+  { read -r pid start < "$FFMPEG_PID_FILE"; } 2>/dev/null || return 0
+  [[ $pid =~ ^[0-9]+$ && $start =~ ^[0-9]+$ ]] || return 0
+  [[ $(proc_starttime "$pid") == "$start" ]] && echo "$pid"
+  return 0
+}
+# Take the session lock for the rest of this process (released at exit). Re-entrant, so
+# the exit cleanup can run while a transition of this same process holds it.
+lock_session() {
+  [[ -n $LOCK_FD ]] && return 0
+  exec {LOCK_FD}>>"$LOCK"
+  flock "$LOCK_FD"
+}
+unlock_session() {
+  [[ -n $LOCK_FD ]] || return 0
+  flock -u "$LOCK_FD"
+  exec {LOCK_FD}>&-
+  LOCK_FD=""
 }
 webcam_running() { [[ -n $(ffmpeg_pid) ]]; }
 start_path() { head -1 "$STATE"; }
@@ -95,20 +117,44 @@ camera_stream_start() {
   return 1
 }
 
+# Stop the recorded ffmpeg through a pidfd: the process is pinned by the descriptor, and
+# its start time is verified after opening it, so the signals cannot reach a process that
+# reused the PID, not even between the check and the signal. ffmpeg can block on the UDP
+# read once the camera stops sending, ignoring SIGTERM, hence the SIGKILL fallback.
 stop_stream() {
-  local pid
-  # ffmpeg can block on the UDP read once the camera stops sending, ignoring SIGTERM.
-  pid=$(ffmpeg_pid)
-  [[ -n $pid ]] && kill "$pid" 2>/dev/null
-  for _ in $(seq 6); do webcam_running || break; sleep 0.5; done
-  pid=$(ffmpeg_pid)
-  [[ -n $pid ]] && kill -KILL "$pid" 2>/dev/null
+  local pid="" start=""
+  { read -r pid start < "$FFMPEG_PID_FILE"; } 2>/dev/null || true
+  if [[ $pid =~ ^[0-9]+$ && $start =~ ^[0-9]+$ ]]; then
+    python3 -I -c '
+import os, select, signal, sys
+pid, start = int(sys.argv[1]), sys.argv[2]
+try:
+    fd = os.pidfd_open(pid)
+except OSError:
+    sys.exit(0)
+try:
+    with open(f"/proc/{pid}/stat") as f:
+        fields = f.read().rsplit(")", 1)[1].split()
+except OSError:
+    sys.exit(0)
+if fields[19] != start:
+    sys.exit(0)
+for sig, grace in ((signal.SIGTERM, 3), (signal.SIGKILL, 2)):
+    try:
+        signal.pidfd_send_signal(fd, sig)
+    except ProcessLookupError:
+        break
+    if select.select([fd], [], [], grace)[0]:   # readable once the process has exited
+        break
+' "$pid" "$start" || true
+  fi
   rm -f "$FFMPEG_PID_FILE"
   api /gopro/webcam/stop || true
   api /gopro/webcam/exit || true
 }
 
 stop() {
+  lock_session
   stop_stream
   rm -f "$STATE"
   echo "GoPro webcam stopped."
@@ -117,6 +163,7 @@ stop() {
 # On exit, only clean up if no newer "start" has taken over the stream.
 cleanup() {
   kill $(jobs -p) 2>/dev/null || true
+  lock_session
   [[ $(state_owner) == "$$" ]] && stop
 }
 
@@ -156,6 +203,8 @@ start() {
 
   [[ -e $DEVICE ]] || sudo modprobe v4l2loopback devices=1 video_nr=42 card_label="GoPro HERO12" exclusive_caps=1
 
+  # The whole hand-over, up to recording the new ffmpeg, is one session transition.
+  lock_session
   # Claim the state before stopping a previous instance, so its cleanup leaves the camera alone.
   printf '%s\n%s\n' "/gopro/webcam/start?res=${res}&fov=${fov}&port=${UDP_PORT}" "$$" > "$STATE"
   stop_stream
@@ -164,16 +213,18 @@ start() {
   trap cleanup EXIT
   camera_stream_start || exit 1
   echo "GoPro webcam running on $DEVICE (Ctrl+C to stop)."
-  refresh_pipewire &
-  watchdog &
+  # Long-lived children must not inherit the lock descriptor.
+  refresh_pipewire {LOCK_FD}>&- &
+  watchdog {LOCK_FD}>&- &
   ffmpeg -hide_banner -loglevel error -nostdin -threads 1 \
     -fflags nobuffer -flags low_delay \
     -i "udp://@:${UDP_PORT}?localaddr=${HOST_IP}&sources=${CAM_IP}&overrun_nonfatal=1&fifo_size=50000000" \
-    -vf format=yuv420p -f v4l2 "$DEVICE" &
+    -vf format=yuv420p -f v4l2 "$DEVICE" {LOCK_FD}>&- &
   stream_pid=$!
-  # Record the child so stop/watchdog address this exact process. The PID file is
-  # written immediately after the launch, before anyone can observe a running stream.
-  printf '%s\n' "$stream_pid" > "$FFMPEG_PID_FILE"
+  # Record the child so stop addresses this exact process, still under the lock, so no
+  # other session can observe or stop the stream before it is tracked.
+  record_stream "$stream_pid"
+  unlock_session
   # Stay in the foreground like the plain "ffmpeg ..." call did, and propagate its status.
   wait "$stream_pid"
 }
@@ -200,6 +251,7 @@ start_detached() {
 # stream with the new parameters. ffmpeg and /dev/video42 stay open, so apps keep the source.
 change_stream() {
   local key=$1 value=$2
+  lock_session
   webcam_running && [[ -f $STATE ]] || { echo "Webcam is not running. Use: $(basename "$0") start" >&2; exit 1; }
 
   # 1. Aplicar el cambio solicitado en el fichero de estado
@@ -328,20 +380,23 @@ download() {
   # The camera chooses these names, so accept only plain "<folder>/<file>" paths.
   [[ $path =~ ^[A-Za-z0-9_]+/[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] \
     || { echo "Refusing unexpected file name from camera: $path" >&2; exit 1; }
-  local file=${path##*/} target tmp
+  local file=${path##*/} target tmp id
   target="$dir/$file"
   # Never replace an existing file or follow a symlink planted at the target.
   [[ -e $target || -L $target ]] && { echo "Already exists: $target" >&2; exit 1; }
   echo "Downloading $file to $dir"
-  # mktemp creates a fresh file exclusively; mv --no-clobber renames it atomically
-  # without replacing anything that appeared at the target meanwhile.
+  # mktemp creates a fresh file exclusively. mv -T treats the target as a file name even
+  # if a directory, or a symlink to one, appears there meanwhile, and --no-clobber renames
+  # atomically without replacing whatever is there.
   tmp=$(mktemp "$dir/.gopro-download.XXXXXX")
   if ! curl -f --progress-bar -o "$tmp" "$CAM/videos/DCIM/$path"; then
     rm -f "$tmp"; exit 1
   fi
+  id=$(stat -c %d:%i -- "$tmp")
   # Some coreutils versions exit non-zero when -n skips; the check below decides.
-  mv --no-clobber "$tmp" "$target" || true
-  if [[ -e $tmp ]]; then
+  mv -T --no-clobber -- "$tmp" "$target" 2>/dev/null || true
+  # Success only if the target is now the very file that was downloaded.
+  if [[ -e $tmp || -L $target || ! -f $target || $(stat -c %d:%i -- "$target") != "$id" ]]; then
     rm -f "$tmp"; echo "Already exists: $target" >&2; exit 1
   fi
 }

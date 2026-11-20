@@ -16,17 +16,33 @@ matching command line, `stop_stream()` killed that process.
 
 ## The ownership model now
 
-`start` records the PID of the ffmpeg it launches in `$XDG_RUNTIME_DIR/gopro-webcam.ffmpeg`
-and the plugin only ever signals that PID. Identity is re-checked immediately before any
-signal, because the kernel recycles PIDs:
+`start` records `<pid> <start time>` of the ffmpeg it launches in
+`$XDG_RUNTIME_DIR/gopro-webcam.ffmpeg`. The start time is field 22 of `/proc/<pid>/stat`:
+together with the PID it names one process for the whole boot, because a process that later
+reuses the PID starts later, whatever its executable and arguments.
 
-1. the PID refers to a live process;
-2. its executable is `ffmpeg`;
-3. its command line still carries this plugin's loopback device and UDP port.
+`stop_stream()` opens a pidfd for the recorded PID, verifies the start time after opening it,
+and sends `SIGTERM`, then `SIGKILL`, through that descriptor. The pidfd pins the process, so
+there is no window between the check and the signal in which a recycled PID could be hit. If
+the start time does not match, or the file holds a bare PID, nothing is signalled.
+`stop_stream()` removes the PID file after stopping and never removes, rewrites or follows
+anything it did not create.
 
-If any check fails the answer is "not my stream" and nothing is signalled. `stop_stream()`
-removes the PID file after stopping and never removes, rewrites or follows anything it did
-not create.
+Session transitions — `start` up to recording its ffmpeg, `stop`, the exit cleanup, and lens
+or resolution changes — hold `$XDG_RUNTIME_DIR/gopro-webcam.lock` (`flock`), so a concurrent
+Start and Stop cannot remove each other's tracking. Long-lived children (ffmpeg, the watchdog)
+do not inherit the lock descriptor.
+
+## Fourth round: identity and the final rename
+
+The previous model re-checked identity with heuristics — executable name and command line —
+and then signalled by number. Both gaps follow from rule 2 below being applied halfway: the
+PID was re-checked, but with a predicate a same-argument ffmpeg also satisfies, and the check
+and the `kill` were separate operations. The same applied to the download: `mv --no-clobber`
+was checked for "temporary file gone", which is also true when `mv` moved it *into* a
+directory that appeared at the target. The result is now checked for what success means: the
+target is a regular file with the downloaded file's inode, and `mv -T` treats the target as
+a file name throughout.
 
 ## Why the construction review missed it
 
@@ -67,7 +83,10 @@ question before the code counts as reviewed.
 - Destructive operations target a handle this process created — a PID we spawned, a file we
   opened — never something rediscovered by searching. Verify identity immediately before use.
 - A recorded identifier is untrusted when it is reused: PIDs, temporary names and paths are
-  re-checked, not trusted because we wrote them earlier.
+  re-checked, not trusted because we wrote them earlier. Re-check with an exact identity
+  (start time, inode), not a description that another object can also match, and act on a
+  pinned handle (pidfd) so the check stays true until the action.
+- Check the result for what success means, not for the absence of one failure.
 - Fix the model, not the symptom: when a predicate produces false positives, ask what it was
   trying to prove instead of tightening its pattern.
 - Every fix ships with the test that fails on the old code.
@@ -77,9 +96,16 @@ question before the code counts as reviewed.
 
 ```bash
 ./test/process-ownership.sh
+./test/download.sh
 ```
 
-It loads the plugin's shell functions without running the CLI dispatch, redirects their paths
-to a temporary directory, and uses real ffmpeg processes as stand-ins for "our stream", "a
-foreign ffmpeg that matches the old pattern", and "a recycled PID". Seven assertions; exits 77
-when ffmpeg is not installed.
+Both load the plugin's shell functions without running the CLI dispatch and redirect their
+paths to a temporary directory.
+
+`process-ownership.sh` uses real ffmpeg processes as stand-ins for "our stream", "a foreign
+ffmpeg that matches the old pattern", and "a recycled PID", including one with the stream's
+exact arguments, and checks that `stop` waits for a session holding the lock. Twelve
+assertions; exits 77 when ffmpeg is not installed.
+
+`download.sh` stubs the camera and changes the destination during the download: an existing
+file, a directory and a symlink to a directory must all fail without leaving anything behind.

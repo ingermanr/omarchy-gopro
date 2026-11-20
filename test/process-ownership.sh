@@ -33,11 +33,13 @@ alive() { kill -0 "$1" 2>/dev/null; }
 sed -n '1,/^cmd=\${1:-start}/p' "$ROOT/bin/gopro-webcam" | sed '$d' > "$WORK/lib.sh"
 # shellcheck disable=SC1090
 source "$WORK/lib.sh"
+set +e   # lib.sh enables errexit; assertions must keep running after a failure
 
 DEVICE="$WORK/dev42"
 UDP_PORT=8554
 FFMPEG_PID_FILE="$WORK/ffmpeg.pid"
 STATE="$WORK/state"
+LOCK="$WORK/lock"
 RUNTIME_DIR="$WORK"
 LOG="$WORK/log"
 CAM="http://127.0.0.1:1"
@@ -70,8 +72,8 @@ webcam_running && bad "a running stream is claimed without a PID file" \
               || ok "no PID file means no stream, even with a matching foreign ffmpeg"
 
 printf '%s\n' "$d" > "$FFMPEG_PID_FILE"
-webcam_running && bad "a recorded PID with a different command line was accepted" \
-              || ok "a recorded PID must also match this plugin's own command line"
+webcam_running && bad "a bare PID without its start time was accepted" \
+              || ok "a recorded PID must carry the start time of the process it names"
 
 stop_stream
 sleep 0.3
@@ -79,7 +81,7 @@ alive "$d" && ok "stop_stream left the foreign ffmpeg alone" \
            || bad "stop_stream killed a foreign ffmpeg"
 
 o=$(own); pids="$pids $o"; sleep 1
-printf '%s\n' "$o" > "$FFMPEG_PID_FILE"
+record_stream "$o"
 [[ $(ffmpeg_pid) == "$o" ]] && ok "the plugin's own ffmpeg is recognised" \
                            || bad "the plugin's own ffmpeg was not recognised"
 stop_stream
@@ -95,6 +97,35 @@ stop_stream
 sleep 0.3
 alive "$u" && ok "a recycled PID that is not the stream is not signalled" \
            || bad "a recycled PID was signalled"
+
+# A PID recycled by an ffmpeg with exactly the stream's arguments: only the start time
+# tells it apart from the process that was recorded.
+r=$(own); pids="$pids $r"; sleep 1
+printf '%s %s\n' "$r" 1 > "$FFMPEG_PID_FILE"
+webcam_running && bad "a recycled PID with identical arguments counts as the stream" \
+              || ok "a recycled PID with identical arguments is not the stream"
+stop_stream
+sleep 0.3
+alive "$r" && ok "a recycled PID with identical arguments is not signalled" \
+           || bad "a recycled PID with identical arguments was signalled"
+printf '%s\n' "$r" > "$FFMPEG_PID_FILE"
+stop_stream
+sleep 0.3
+alive "$r" && ok "a bare PID with identical arguments is not signalled" \
+           || bad "a bare PID with identical arguments was signalled"
+
+# Session transitions are serialized: "stop" waits while another session holds the lock,
+# so it cannot remove tracking that session is writing.
+printf 'start\n%s\n' 99999 > "$STATE"
+flock "$LOCK" sleep 2 &
+holder=$!; sleep 0.3
+( stop >/dev/null ) &
+stopper=$!; sleep 0.7
+[[ -e $STATE ]] && ok "stop waits while another session transition holds the lock" \
+                || bad "stop removed the state while another session held the lock"
+wait "$holder" "$stopper"
+[[ -e $STATE ]] && bad "stop did not complete once the lock was released" \
+                || ok "stop completes once the lock is released"
 
 printf '\npassed=%d failed=%d\n' "$pass" "$fail"
 (( fail > 0 )) && exit 1
